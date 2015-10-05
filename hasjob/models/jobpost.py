@@ -8,10 +8,10 @@ from sqlalchemy import event, DDL
 from sqlalchemy.orm import defer
 from sqlalchemy.ext.associationproxy import association_proxy
 from sqlalchemy.dialects.postgresql import TSVECTOR
-from coaster.sqlalchemy import make_timestamp_columns, Query, JsonDict
-from baseframe import cache
-from baseframe.staticdata import webmail_domains
 import tldextract
+from coaster.sqlalchemy import make_timestamp_columns, Query, JsonDict
+from baseframe import cache, _
+from baseframe.staticdata import webmail_domains
 from .. import redis_store
 from . import newlimit, agelimit, db, POSTSTATUS, EMPLOYER_RESPONSE, PAY_TYPE, BaseMixin, TimestampMixin
 from .jobtype import JobType
@@ -108,7 +108,6 @@ class JobPost(BaseMixin, db.Model):
     email = db.Column(db.Unicode(80), nullable=False)
     email_domain = db.Column(db.Unicode(80), nullable=False, index=True)
     domain_id = db.Column(None, db.ForeignKey('domain.id'), nullable=False)
-    domain = db.relationship('Domain', lazy='joined', backref=db.backref('jobposts', lazy='dynamic'))
     md5sum = db.Column(db.String(32), nullable=False, index=True)
 
     # Payment, audit and workflow fields
@@ -190,6 +189,22 @@ class JobPost(BaseMixin, db.Model):
             return False
         return user == self.user or user in self.admins
 
+    @property
+    def expiry_date(self):
+        return self.datetime + agelimit
+
+    @property
+    def after_expiry_date(self):
+        return self.expiry_date + timedelta(days=1)
+
+    def status_label(self):
+        if self.status == POSTSTATUS.DRAFT:
+            return _("Draft")
+        elif self.status == POSTSTATUS.PENDING:
+            return _("Pending")
+        elif self.is_new():
+            return _("New!")
+
     def is_draft(self):
         return self.status == POSTSTATUS.DRAFT
 
@@ -219,11 +234,26 @@ class JobPost(BaseMixin, db.Model):
     def is_new(self):
         return self.datetime >= datetime.utcnow() - newlimit
 
+    def is_closed(self):
+        return self.status == POSTSTATUS.CLOSED
+
+    def is_unacceptable(self):
+        return self.status in [POSTSTATUS.REJECTED, POSTSTATUS.SPAM]
+
     def is_old(self):
         return self.datetime <= datetime.utcnow() - agelimit
 
     def pay_type_label(self):
         return PAY_TYPE.get(self.pay_type)
+
+    def withdraw(self):
+        self.status = POSTSTATUS.WITHDRAWN
+
+    def close(self):
+        self.status = POSTSTATUS.CLOSED
+
+    def confirm(self):
+        self.status = POSTSTATUS.CONFIRMED
 
     def url_for(self, action='view', _external=False, **kwargs):
         if self.status in POSTSTATUS.UNPUBLISHED and action in ('view', 'edit'):
@@ -248,6 +278,10 @@ class JobPost(BaseMixin, db.Model):
             return url_for('editjob', hashid=self.hashid, domain=domain, _external=_external, **kwargs)
         elif action == 'withdraw':
             return url_for('withdraw', hashid=self.hashid, domain=domain, _external=_external, **kwargs)
+        elif action == 'close':
+            return url_for('close', hashid=self.hashid, domain=domain, _external=_external, **kwargs)
+        elif action == 'reopen':
+            return url_for('reopen', hashid=self.hashid, domain=domain, _external=_external, **kwargs)
         elif action == 'moderate':
             return url_for('moderatejob', hashid=self.hashid, domain=domain, _external=_external, **kwargs)
         elif action == 'pin':
@@ -419,17 +453,48 @@ class JobPost(BaseMixin, db.Model):
             redis_store.hdel(cache_key, key)
 
     @cached_property
-    def ab_views(self):
-        na_count = JobViewSession.query.filter_by(jobpost=self, bgroup=None).count()
+    def ab_impressions(self):
+        results = {'NA': 0, 'A': 0, 'B': 0}
         counts = db.session.query(
-            JobViewSession.bgroup.label('bgroup'), db.func.count(JobViewSession.bgroup).label('count')).filter(
-            JobViewSession.jobpost == self, JobViewSession.bgroup != None).group_by(JobViewSession.bgroup)  # NOQA
-        results = {'NA': na_count, 'A': 0, 'B': 0}
+            JobImpression.bgroup.label('bgroup'), db.func.count('*').label('count')).filter(
+            JobImpression.jobpost == self).group_by(JobImpression.bgroup)
         for row in counts:
             if row.bgroup is False:
                 results['A'] = row.count
             elif row.bgroup is True:
                 results['B'] = row.count
+            else:
+                results['NA'] = row.count
+        return results
+
+    @cached_property
+    def ab_views(self):
+        results = {
+            'C_NA': 0, 'C_A': 0, 'C_B': 0,  # Conversions (cointoss=True, crosstoss=False)
+            'E_NA': 0, 'E_A': 0, 'E_B': 0,  # External (cointoss=False, crosstoss=True OR False [do sum])
+            'X_NA': 0, 'X_A': 0, 'X_B': 0,  # Cross toss (cointoss=True, crosstoss=True)
+            }
+        counts = db.session.query(
+            JobViewSession.bgroup.label('bgroup'),
+            JobViewSession.cointoss.label('cointoss'),
+            JobViewSession.crosstoss.label('crosstoss'),
+            db.func.count('*').label('count')
+            ).filter(JobViewSession.jobpost == self
+            ).group_by(JobViewSession.bgroup, JobViewSession.cointoss, JobViewSession.crosstoss)
+
+        for row in counts:
+            if row.cointoss is True and row.crosstoss is False:
+                prefix = 'C'
+            elif row.cointoss is False:
+                prefix = 'E'
+            elif row.cointoss is True and row.crosstoss is True:
+                prefix = 'X'
+            if row.bgroup is False:
+                results[prefix + '_A'] += row.count
+            elif row.bgroup is True:
+                results[prefix + '_B'] += row.count
+            else:
+                results[prefix + '_NA'] += row.count
         return results
 
     @property
@@ -630,6 +695,10 @@ class JobImpression(TimestampMixin, db.Model):
         # (jobpost_id, event_session_id) primary key order.
         return cls.query.get((jobpost.id, event_session.id))
 
+    @classmethod
+    def get_by_ids(cls, jobpost_id, event_session_id):
+        return cls.query.get((jobpost_id, event_session_id))
+
 
 class JobViewSession(TimestampMixin, db.Model):
     __tablename__ = 'job_view_session'
@@ -641,12 +710,25 @@ class JobViewSession(TimestampMixin, db.Model):
     #: Job post that was viewed
     jobpost_id = db.Column(None, db.ForeignKey('jobpost.id'), primary_key=True, index=True)
     jobpost = db.relationship(JobPost)
+    #: Related impression
+    impression = db.relationship(JobImpression,
+        primaryjoin='''and_(JobViewSession.event_session_id == foreign(JobImpression.event_session_id),
+            JobViewSession.jobpost_id == foreign(JobImpression.jobpost_id))''',
+        uselist=False, backref='view')
     #: Was this view in the B group of an A/B test? (null = no test conducted)
     bgroup = db.Column(db.Boolean, nullable=True)
+    #: Was the bgroup assigned by coin toss or was it predetermined?
+    cointoss = db.Column(db.Boolean, nullable=False, default=False)
+    #: Does this bgroup NOT match the impression's bgroup?
+    crosstoss = db.Column(db.Boolean, nullable=False, default=False)
 
     @classmethod
     def get(cls, event_session, jobpost):
         return cls.query.get((event_session.id, jobpost.id))
+
+    @classmethod
+    def get_by_ids(cls, event_session_id, jobpost_id):
+        return cls.query.get((event_session_id, jobpost_id))
 
 
 class JobApplication(BaseMixin, db.Model):

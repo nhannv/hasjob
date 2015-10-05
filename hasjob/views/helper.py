@@ -21,7 +21,7 @@ from .. import app, redis_store
 from ..models import (agelimit, newlimit, db, JobCategory, JobPost, JobType, POSTSTATUS, BoardJobPost, Tag, JobPostTag,
     Campaign, CampaignView, CampaignAnonView, EventSessionBase, EventSession, UserEventBase, UserEvent, JobImpression,
     JobViewSession, AnonUser, campaign_event_session_table, JobLocation, PAY_TYPE)
-from ..utils import scrubemail, redactemail, randbool
+from ..utils import scrubemail, redactemail, cointoss
 
 
 gif1x1 = 'R0lGODlhAQABAJAAAP8AAAAAACH5BAUQAAAALAAAAAABAAEAAAICBAEAOw=='.decode('base64')
@@ -70,7 +70,7 @@ def load_user_data(user):
     g.event_data = {}   # Views can add data to the current pageview event
     g.esession = None
     g.viewcounts = {}
-    g.impressions = {}
+    g.impressions = session.pop('impressions', {})  # Retrieve from cookie session if present there
     g.campaign_views = []
     g.jobpost_viewed = None, None
     g.bgroup = None
@@ -270,16 +270,10 @@ def record_views_and_events(response):
                 save_impressions.delay(g.esession.id, g.impressions.values())
 
             if g.jobpost_viewed != (None, None):
-                jvs = JobViewSession.get(jobpost=g.jobpost_viewed[0], event_session=g.esession)
-                if jvs is None:
-                    jvs = JobViewSession(jobpost=g.jobpost_viewed[0], event_session=g.esession)
-                    db.session.add(jvs)
-
-                jvs.bgroup = g.jobpost_viewed[1]
-                try:
-                    db.session.commit()
-                except IntegrityError:
-                    db.session.rollback()
+                save_jobview.delay(
+                    event_session_id=g.esession.id,
+                    jobpost_id=g.jobpost_viewed[0].id,
+                    bgroup=g.jobpost_viewed[1])
         else:
             g.esession.save_to_cache(session['au'])
             if g.impressions:
@@ -302,7 +296,7 @@ def session_jobpost_ab():
 
 
 def bgroup(jobpost_ab, post):
-    return jobpost_ab.get(post.id) or randbool() if post.headlineb else None
+    return jobpost_ab.get(post.id) or cointoss() if post.headlineb else None
 
 
 def cache_viewcounts(posts):
@@ -437,16 +431,43 @@ def make_pay_graph(currency, posts, rmin=None, rmax=None, minposts=5):
 
 
 @job('hasjob')
-def save_impressions(sessionid, impressions):
+def save_jobview(event_session_id, jobpost_id, bgroup):
+    """
+    Save a jobpost view as a background job to ensure this doesn't fire *before* the
+    associated save_impressions job. Queue order is important for the cointoss flag
+    in A/B testing.
+    """
+    jvs = JobViewSession.get_by_ids(event_session_id=event_session_id, jobpost_id=jobpost_id)
+    if jvs is None:
+        jvs = JobViewSession(event_session_id=event_session_id, jobpost_id=jobpost_id)
+        db.session.add(jvs)
+
+        jvs.bgroup = bgroup
+
+        # Since this is a new view, is there an existing job impression in the same session
+        # which has a bgroup defined? If yes, this view has an associated coin toss.
+        ji = JobImpression.get_by_ids(jobpost_id=jobpost_id, event_session_id=event_session_id)
+        if ji:
+            jvs.cointoss = True
+            if ji.bgroup != jvs.bgroup and jvs.bgroup is not None:
+                jvs.crosstoss = True
+        else:
+            jvs.cointoss = False
+
+        db.session.commit()
+
+
+@job('hasjob')
+def save_impressions(session_id, impressions):
     """
     Save impressions against each job and session.
     """
     with app.test_request_context():
         for pinned, postid, bgroup in impressions:
-            ji = JobImpression.query.get((postid, sessionid))
+            ji = JobImpression.query.get((postid, session_id))
             new_impression = False
             if ji is None:
-                ji = JobImpression(jobpost_id=postid, event_session_id=sessionid, pinned=False, bgroup=bgroup)
+                ji = JobImpression(jobpost_id=postid, event_session_id=session_id, pinned=False, bgroup=bgroup)
                 db.session.add(ji)
                 new_impression = True
             # Never set pinned=False on an existing JobImpression instance. The pinned status
@@ -538,16 +559,21 @@ def url_from_ob(ob):
         return url_for('browse_by_category', name=ob.name)
 
 
+def use_timezone():
+    if g and g.user:
+        return g.user.tz
+    else:
+        return timezone(app.config['TIMEZONE'])
+
+
 @app.template_filter('shortdate')
 def shortdate(date):
-    tz = timezone(app.config['TIMEZONE'])
-    return utc.localize(date).astimezone(tz).strftime('%b %e')
+    return utc.localize(date).astimezone(use_timezone()).strftime('%b %e')
 
 
 @app.template_filter('longdate')
 def longdate(date):
-    tz = timezone(app.config['TIMEZONE'])
-    return utc.localize(date).astimezone(tz).strftime('%B %e, %Y')
+    return utc.localize(date).astimezone(use_timezone()).strftime('%B %e, %Y')
 
 
 @app.template_filter('cleanurl')

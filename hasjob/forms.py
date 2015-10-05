@@ -474,7 +474,7 @@ class ConfirmForm(forms.Form):
 
 class WithdrawForm(forms.Form):
     really_withdraw = forms.BooleanField("Yes, I really want to withdraw the job post",
-        validators=[forms.validators.DataRequired(u"If you don’t want to withdraw the post, just close this page")])
+        validators=[forms.validators.DataRequired(u"You must confirm withdrawal")])
 
 
 class ReportForm(forms.Form):
@@ -657,10 +657,13 @@ class CampaignForm(forms.Form):
     geonameids = forms.GeonameSelectMultiField("Locations",
         description=__("This campaign will be targetted at users and jobs with matching locations"))
     user_required = forms.RadioField(__("User is required"), coerce=getbool,
-        choices=[(None, __("N/A")), (True, __("Yes")), (False, __("No"))])
+        choices=[
+            (None, __(u"N/A – Don’t target by login status")),
+            (True, __(u"Yes – Show to logged in users")),
+            (False, __(u"No – Show to anonymous users"))])
     flags = forms.RadioMatrixField("Flags", coerce=getbool, fields=Campaign.flag_choices,
         description=__("All selected flags must match the logged in user for the campaign to be shown"),
-        choices=[('None', __("N/A")), ('True', __("True")), ('False', __("False"))])
+        choices=[('None', __(u"N/A")), ('True', __(u"True")), ('False', __(u"False"))])
     content = forms.FormField(CampaignContentForm, __("Campaign content"))
 
     def validate_geonameids(self, field):
